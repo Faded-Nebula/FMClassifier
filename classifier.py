@@ -45,69 +45,65 @@ def integral(x_list, y_list, increase=True):
             integral -= delta
     return integral
 
-def compute_divergence(xt, t, cls, sample=10) -> torch.Tensor:
+def compute_divergence(xt, t, cls, sample=10):
     vt = model.forward(t, xt, cls).view(-1, 1, 32, 32)
-    div_samples = []
+    div = np.zeros((xt.shape[0],), dtype=np.float32)
     # Approximate the Jacobian by Hutchinson’s Trace Estimator
     for _ in range(sample):  # Sample 10 times
         e = torch.randn_like(vt)
-        dot = torch.sum(vt * e)
-        grad = torch.autograd.grad(dot, xt, create_graph=False, retain_graph=True)[0]
-        div_samples.append(torch.sum(grad * e))
-    return torch.mean(torch.stack(div_samples))  # Take the average of the samples
+        dot = torch.sum(vt * e, dim=(1, 2, 3))
+        grad = torch.autograd.grad(dot, xt, grad_outputs=torch.ones_like(dot), create_graph=False, retain_graph=True)[0]
+        div += torch.sum(grad * e, dim=(1, 2, 3)).detach().cpu().numpy() / sample
+    return div # Take the average of the samples
 
 def classifier(x, steps=2, sample=10):
     # Enumerate the classes
-    x = x.repeat(1, 1, 1, 1)  # Shape: (1, 1, 32, 32)
+    x = x.repeat(10, 1, 1, 1)  # Shape: (1, 1, 32, 32)
     classes = torch.arange(10, device=device)
-    time_steps = exponential_interval(1, 0, steps, exp_base=1000.0).to(device)  # Shape: (steps,)
-    log_probs = []
-
+    time_steps = exponential_interval(1, 0, steps, exp_base=100.0).to(device)  # Shape: (steps,)
     # Reverse flow
-    for cls in classes:
-        cls = cls.unsqueeze(0)  # Shape: (1,)
-        with torch.no_grad():
-            if USE_TORCH_DIFFEQ:
-                traj = torchdiffeq.odeint(
-                    lambda t, x: model.forward(t, x, cls),
-                    x,
-                    time_steps,
-                    atol=1e-4,
-                    rtol=1e-4,
-                    method="dopri5",
-                )
-            else:
-                traj = node.trajectory(
-                    x,
-                    time_steps,
-                )
-        # Compute the initial log probability
-        init = traj[-1].view(-1, 1, 32, 32)
+    with torch.no_grad():
+        if USE_TORCH_DIFFEQ:
+            traj = torchdiffeq.odeint(
+                lambda t, x: model.forward(t, x, classes),
+                x,
+                time_steps,
+                atol=1e-4,
+                rtol=1e-4,
+                method="dopri5",
+            )
+        else:
+            traj = node.trajectory(
+                x,
+                time_steps,
+            )
+    # Compute the initial log probability
+    init = traj[-1].view(-1, 1, 32, 32)
+    
+    log_prob = -torch.sum(init ** 2, dim=(1, 2, 3)) / 2 - 0.5 * 32 * 32 * torch.log(torch.tensor(2 * np.pi, device=device))
+    log_prob = log_prob.detach().cpu().numpy()
+
+    # Compute the divergence
+    div_list = []
+    for i in range(steps):
+        t = time_steps[i]
+        xt = traj[i].view(-1, 1, 32, 32)
+        xt.requires_grad_(True)
+        div = compute_divergence(xt, t, classes, sample=sample)
+        div_list.append(div)
+    print(f"div_list: {div_list}")
+    # Integrate the divergence
+    log_prob -= integral(time_steps.cpu().numpy(), div_list, increase=False)
         
-        log_prob = -torch.sum(init ** 2) / 2 - 0.5 * 32 * 32 * torch.log(torch.tensor(2 * np.pi, device=device))
-        log_prob = log_prob.item()
-        # Compute the divergence
-        div_list = []
-        for i in range(steps):
-            t = time_steps[i]
-            xt = traj[i].view(-1, 1, 32, 32)
-            xt.requires_grad_(True)
-            div = compute_divergence(xt, t, cls, sample=sample)
-            div_list.append(div)
-            
-        # Integrate the divergence
-        log_prob -= integral(time_steps.cpu().numpy(), torch.tensor(div_list).cpu().numpy(), increase=False)
-        log_probs.append(log_prob)
-        
-    return np.argmax(log_probs), log_probs
+    return np.argmax(log_prob), log_prob
     
 if __name__ == "__main__":
     
     # Load MNIST dataset
     transform = transforms.Compose([transforms.Pad(2),transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
-    mnist = datasets.MNIST(root="data", train=False, download=True, transform=transform)
+    mnist = datasets.MNIST(root="data", train=True, download=True, transform=transform)
 
-    # Select 100 sample image and label pairs
+    # Select 10 sample image and label pairs
     sample_indices = np.random.choice(len(mnist), 100, replace=False)
     samples = [mnist[i] for i in sample_indices]
     acc_num = 0
@@ -115,7 +111,7 @@ if __name__ == "__main__":
     with tqdm(samples, desc="Processing samples") as pbar:
         for i, (img, label) in enumerate(pbar):
             img = img.unsqueeze(0).to(device)
-            prediction, _ = classifier(img, steps=100, sample=10)
+            prediction, _ = classifier(img, steps=100, sample=20)
             if prediction == label:
                 acc_num += 1
             pbar.set_postfix({"Prediction": prediction, "Label": label, "Accuracy": acc_num / (i + 1)})
