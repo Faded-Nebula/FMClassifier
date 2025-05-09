@@ -26,7 +26,7 @@ train_loader = torch.utils.data.DataLoader(
     trainset, batch_size=batch_size, shuffle=True, drop_last=True
 )
 
-sigma = 0.0
+sigma = 0.01
 model = UNetModel(
     dim=(1, 32, 32), num_channels=32, num_res_blocks=2, channel_mult=(2, 2, 2, 2), num_classes=10, class_cond=True
 ).to(device)
