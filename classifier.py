@@ -46,15 +46,29 @@ def integral(x_list, y_list, increase=True):
     return integral
 
 def compute_divergence(xt, t, cls, sample=10):
-    vt = model.forward(t, xt, cls).view(-1, 1, 32, 32)
-    div = np.zeros((xt.shape[0],), dtype=np.float32)
-    # Approximate the Jacobian by Hutchinson’s Trace Estimator
-    for _ in range(sample):  # Sample 10 times
-        e = torch.randn_like(vt)
-        dot = torch.sum(vt * e, dim=(1, 2, 3))
-        grad = torch.autograd.grad(dot, xt, grad_outputs=torch.ones_like(dot), create_graph=False, retain_graph=True)[0]
-        div += torch.sum(grad * e, dim=(1, 2, 3)).detach().cpu().numpy() / sample
-    return div # Take the average of the samples
+    batch_size = xt.shape[0]
+
+    # Repeat inputs for vectorized sampling
+    xt_rep = xt.repeat(sample, 1, 1, 1)
+    cls_rep = cls.repeat(sample)
+    
+    
+    vt = model.forward(t, xt_rep, cls_rep).view(-1, 1, 32, 32)
+    noise = torch.randn_like(vt)
+
+    dot = torch.sum(vt * noise, dim=(1, 2, 3))
+    grad_vt = torch.autograd.grad(
+        outputs=dot,
+        inputs=xt_rep,
+        grad_outputs=torch.ones_like(dot),
+        create_graph=False,
+        retain_graph=False
+    )[0]
+
+    divergence = torch.sum(grad_vt * noise, dim=(1, 2, 3))
+    divergence = divergence.view(sample, batch_size).mean(dim=0)
+
+    return divergence.detach().cpu().numpy()
 
 def classifier(x, steps=2, sample=10):
     # Enumerate the classes
@@ -91,7 +105,7 @@ def classifier(x, steps=2, sample=10):
         xt.requires_grad_(True)
         div = compute_divergence(xt, t, classes, sample=sample)
         div_list.append(div)
-    print(f"div_list: {div_list}")
+    # print(f"div_list: {div_list}")
     # Integrate the divergence
     log_prob -= integral(time_steps.cpu().numpy(), div_list, increase=False)
         
