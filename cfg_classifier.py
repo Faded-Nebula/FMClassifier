@@ -16,15 +16,16 @@ from torchvision import datasets, transforms
 
 # Load model
 USE_TORCH_DIFFEQ = True
+guidance = 0.1
 savedir = "models/cond_mnist"
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 model = UNetModel(
-    dim=(1, 32, 32), num_channels=32, num_res_blocks=2, channel_mult=(2, 2, 2, 2), num_classes=10, class_cond=True
+    dim=(1, 32, 32), num_channels=32, num_res_blocks=2, channel_mult=(2, 2, 2, 2), num_classes=11, class_cond=True
 )
 # use torch.load
 model.load_state_dict(
-    torch.load(os.path.join(savedir, "model.pth"), map_location=device, weights_only=True), strict=False
+    torch.load(os.path.join(savedir, "cfg.pth"), map_location=device, weights_only=True), strict=False
 )
 model.to(device)
 node = NeuralODE(model, solver="dopri5", sensitivity="adjoint", atol=1e-4, rtol=1e-4)
@@ -55,8 +56,8 @@ def compute_divergence(xt, t, cls, sample=10):
     xt_rep = xt.repeat(sample, 1, 1, 1)
     cls_rep = cls.repeat(sample)
     
-    
-    vt = model.forward(t, xt_rep, cls_rep).view(-1, 1, 32, 32)
+    empty_label = torch.full_like(cls_rep, 10, device=device)
+    vt = model.forward(t, xt_rep, cls_rep).view(-1, 1, 32, 32) * (1 + guidance) - model.forward(t, xt_rep, empty_label) * guidance
     noise = torch.randn_like(vt)
 
     dot = torch.sum(vt * noise, dim=(1, 2, 3))
@@ -77,13 +78,14 @@ def classifier(x, steps=2, sample=10):
     # Enumerate the classes
     x = x.repeat(10, 1, 1, 1)  # Shape: (1, 1, 32, 32)
     classes = torch.arange(10, device=device)
+    empty_label = torch.full_like(classes, 10, device=device)
     # time_steps = exponential_interval(1, 0, steps, exp_base=100.0).to(device)  # Shape: (steps,)
     time_steps = torch.linspace(1, 0, steps).to(device)  # Shape: (steps,)
     # Reverse flow
     with torch.no_grad():
         if USE_TORCH_DIFFEQ:
             traj = torchdiffeq.odeint(
-                lambda t, x: model.forward(t, x, classes),
+                lambda t, x: model.forward(t, x, classes) * (1 + guidance) - model.forward(t, x, empty_label) * guidance,
                 x,
                 time_steps,
                 atol=1e-4,
@@ -132,7 +134,7 @@ def classifier(x, steps=2, sample=10):
     return prediction
     
 if __name__ == "__main__":
-    steps = 1000
+    steps = 100
     
     # Load MNIST dataset
     transform = transforms.Compose([transforms.Pad(2),transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
@@ -150,7 +152,7 @@ if __name__ == "__main__":
             
             # Count the number of correct predictions at each time step
             acc_num_time_list = [acc_num_time_list[j] + (prediction_time_list[j] == label) for j in range(steps)]
-            
+            pbar.set_postfix({"Accuracy": np.max(acc_num_time_list) / (i + 1)})
     # Calculate the accuracy at each time step
     acc_time_list = [acc_num / len(samples) for acc_num in acc_num_time_list]
     # Plot the accuracy over time
