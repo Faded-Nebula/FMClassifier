@@ -16,16 +16,22 @@ from torchvision import datasets, transforms
 
 # Load model
 USE_TORCH_DIFFEQ = True
-guidance = 0.1
-savedir = "models/cond_mnist"
+savedir = "results/otcfm"
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 model = UNetModel(
-    dim=(1, 32, 32), num_channels=32, num_res_blocks=2, channel_mult=(2, 2, 2, 2), num_classes=11, class_cond=True
+        dim=(3, 32, 32),
+        num_res_blocks=2,
+        num_channels=128,
+        channel_mult=[1, 2, 2, 2],
+        num_heads=4,
+        num_head_channels=64,
+        attention_resolutions="16",
+        dropout=0.1,
 )
 # use torch.load
 model.load_state_dict(
-    torch.load(os.path.join(savedir, "cfg.pth"), map_location=device, weights_only=True), strict=False
+    torch.load(os.path.join(savedir, "otcfm_cifar10_weights_step_400000.pt"), map_location=device, weights_only=True), strict=False
 )
 model.to(device)
 node = NeuralODE(model, solver="dopri5", sensitivity="adjoint", atol=1e-4, rtol=1e-4)
@@ -56,8 +62,8 @@ def compute_divergence(xt, t, cls, sample=10):
     xt_rep = xt.repeat(sample, 1, 1, 1)
     cls_rep = cls.repeat(sample)
     
-    empty_label = torch.full_like(cls_rep, 10, device=device)
-    vt = model.forward(t, xt_rep, cls_rep).view(-1, 1, 32, 32) * (1 + guidance) - model.forward(t, xt_rep, empty_label) * guidance
+    
+    vt = model.forward(t, xt_rep, cls_rep).view(-1, 3, 32, 32)
     noise = torch.randn_like(vt)
 
     dot = torch.sum(vt * noise, dim=(1, 2, 3))
@@ -78,14 +84,13 @@ def classifier(x, steps=2, sample=10):
     # Enumerate the classes
     x = x.repeat(10, 1, 1, 1)  # Shape: (1, 1, 32, 32)
     classes = torch.arange(10, device=device)
-    empty_label = torch.full_like(classes, 10, device=device)
     # time_steps = exponential_interval(1, 0, steps, exp_base=100.0).to(device)  # Shape: (steps,)
     time_steps = torch.linspace(1, 0, steps).to(device)  # Shape: (steps,)
     # Reverse flow
     with torch.no_grad():
         if USE_TORCH_DIFFEQ:
             traj = torchdiffeq.odeint(
-                lambda t, x: model.forward(t, x, classes) * (1 + guidance) - model.forward(t, x, empty_label) * guidance,
+                lambda t, x: model.forward(t, x, classes),
                 x,
                 time_steps,
                 atol=1e-4,
@@ -98,7 +103,7 @@ def classifier(x, steps=2, sample=10):
                 time_steps,
             )
     # Compute the initial log probability
-    init = traj[-1].view(-1, 1, 32, 32)
+    init = traj[-1].view(-1, 3, 32, 32)
     
     log_prob = -torch.sum(init ** 2, dim=(1, 2, 3)) / 2 - 0.5 * 32 * 32 * torch.log(torch.tensor(2 * np.pi, device=device))
     log_prob = log_prob.detach().cpu().numpy()
@@ -107,7 +112,7 @@ def classifier(x, steps=2, sample=10):
     div_list = []
     for i in range(steps):
         t = time_steps[i]
-        xt = traj[i].view(-1, 1, 32, 32)
+        xt = traj[i].view(-1, 3, 32, 32)
         xt.requires_grad_(True)
         div = compute_divergence(xt, t, classes, sample=sample)
         div_list.append(div)
@@ -134,15 +139,26 @@ def classifier(x, steps=2, sample=10):
     return prediction
     
 if __name__ == "__main__":
-    steps = 100
+    steps = 200
     
-    # Load MNIST dataset
+    # Load CIFAR dataset
     transform = transforms.Compose([transforms.Pad(2),transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
-    mnist = datasets.MNIST(root="data", train=False, download=True, transform=transform)
+    dataset = datasets.CIFAR10(
+        root="./data",
+        train=False,
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        ),
+    )
 
     # Select 10 sample image and label pairs
-    sample_indices = np.random.choice(len(mnist), 100, replace=False)
-    samples = [mnist[i] for i in sample_indices]
+    sample_indices = np.random.choice(len(dataset), 100, replace=False)
+    samples = [dataset[i] for i in sample_indices]
     acc_num_time_list = [0 for _ in range(steps)]
     
     with tqdm(samples, desc="Processing samples") as pbar:
